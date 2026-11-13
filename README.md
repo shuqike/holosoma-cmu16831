@@ -1,5 +1,10 @@
 # Holosoma
 
+**Branch: `experiment/fastsac+sem` — CMU 16-831 project.** See the
+[FastSAC + SEM experiment README](README_FASTSAC_SEM.md) for the method,
+paper references, AWS setup, matched-seed collection, live result syncing,
+and Conda-based plotting workflow. The upstream framework overview follows.
+
 Holosoma (Greek: "whole-body") is a comprehensive humanoid robotics framework for training and deploying reinforcement learning policies on humanoid robots, as well as motion retargeting. Supports locomotion (velocity tracking) and whole-body tracking tasks across multiple simulators (IsaacGym, IsaacSim, MJWarp, MuJoCo) with algorithms like PPO and FastSAC.
 
 ## Features

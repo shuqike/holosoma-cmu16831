@@ -5,6 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import tyro
 from pydantic import model_validator
 from pydantic.dataclasses import dataclass
 
@@ -385,11 +386,13 @@ class SceneConfig:
     asset_root: str | None = None
     """Optional root directory for relative asset paths."""
 
-    scene_files: list[SceneFileConfig] | None = None  # Renamed from sources
-    """List of scene files (USD/URDF) to load."""
+    # Optional sequences of dataclasses with a None default cannot be expanded by the legacy CLI.
+    # Keep asset lists in Python presets; suppression changes only CLI exposure, not scene contents.
+    scene_files: tyro.conf.Suppress[list[SceneFileConfig] | None] = None
+    """List of scene files (USD/URDF) to load; set through a Python preset."""
 
-    rigid_objects: list[RigidObjectConfig] | None = None
-    """Standalone rigid objects to instantiate."""
+    rigid_objects: tyro.conf.Suppress[list[RigidObjectConfig] | None] = None
+    """Standalone rigid objects to instantiate; set through a Python preset."""
 
     env_spacing: float = 20.0
     """Distance between parallel environments in the grid layout."""

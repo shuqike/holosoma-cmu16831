@@ -245,6 +245,12 @@ class FastSACConfig:
     actor_hidden_dim: int = 512
     """the hidden dimension of the actor network"""
 
+    use_actor_sem: bool = False
+    """Replace the actor's last hidden activation with grouped softmax (both Gaussian heads)."""
+
+    sem_group_size: int = 64
+    """Features per simplex; must divide actor_hidden_dim // 4 when SEM is enabled."""
+
     use_symmetry: bool = False
     """whether to use symmetry"""
 

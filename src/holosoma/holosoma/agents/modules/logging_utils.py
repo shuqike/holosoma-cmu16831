@@ -436,7 +436,10 @@ class LoggingHelper:
             raise ValueError(f"Path {path} is not in the logging directory {self.log_dir}")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         logger.info(f"Saving checkpoint to {path}")
-        torch.save(state_dict, path)
+        # Publish a complete checkpoint so concurrent rsync readers never see a partial .pt file.
+        temporary_path = path + ".tmp"
+        torch.save(state_dict, temporary_path)
+        os.replace(temporary_path, path)
         self.save_to_wandb(path)
 
     def save_to_wandb(self, file_path: str) -> None:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
 import math
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Sequence
 
@@ -267,6 +269,8 @@ class FastSACAgent(BaseAlgo):
             num_envs=env.num_envs,
             device=device,
             hidden_dim=args.actor_hidden_dim,
+            use_actor_sem=args.use_actor_sem,
+            sem_group_size=args.sem_group_size,
             log_std_max=args.log_std_max,
             log_std_min=args.log_std_min,
             use_tanh=args.use_tanh,
@@ -626,6 +630,14 @@ class FastSACAgent(BaseAlgo):
         # Load checkpoint if specified
         torch_checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
+        # SEM has no parameters: matching weight shapes cannot establish the actor architecture.
+        saved_args = torch_checkpoint.get("args", {})
+        saved_sem = saved_args.get("use_actor_sem", False)
+        if saved_sem != self.config.use_actor_sem or (
+            saved_sem and saved_args.get("sem_group_size", 64) != self.config.sem_group_size
+        ):
+            raise ValueError("Checkpoint SEM settings differ from the configured actor")
+
         # Handle DDP-wrapped models
         actor_state_dict = torch_checkpoint["actor_state_dict"]
         qnet_state_dict = torch_checkpoint["qnet_state_dict"]
@@ -647,6 +659,11 @@ class FastSACAgent(BaseAlgo):
     def learn(self) -> None:
         args = self.config
         device = self.device
+        # The launcher sets this before starting the interpreter, including simulator/import startup.
+        deadline_text = os.environ.get("HOLOSOMA_RUN_DEADLINE_MONOTONIC")
+        deadline = float(deadline_text) if deadline_text is not None else None
+        if deadline is not None and self.is_multi_gpu:
+            raise ValueError("The timed SEM launcher supports single-GPU training only")
         if args.compile:
             update_main = torch.compile(self._update_main)
             update_pol = torch.compile(self._update_pol)
@@ -676,6 +693,9 @@ class FastSACAgent(BaseAlgo):
         pbar = tqdm.tqdm(total=args.num_learning_iterations, initial=self.global_step)
 
         while self.global_step <= args.num_learning_iterations:
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.info("Wall-clock budget reached; saving final policy and closing the simulator")
+                break
             # Synchronize curriculum metrics across GPUs before rollout
             if self.is_multi_gpu:
                 self._synchronize_curriculum_metrics()
@@ -788,6 +808,11 @@ class FastSACAgent(BaseAlgo):
 
                     # Use logging helper
                     self.logging_helper.post_epoch_logging(it=self.global_step, loss_dict=loss_dict, extra_log_dicts={})
+                    started_text = os.environ.get("HOLOSOMA_RUN_STARTED_MONOTONIC")
+                    if started_text is not None:
+                        self.writer.add_scalar(
+                            "Timing/elapsed_wall_time_s", time.monotonic() - float(started_text), self.global_step
+                        )
                 if args.save_interval > 0 and self.global_step > 0 and self.global_step % args.save_interval == 0:
                     if self.is_main_process:
                         logger.info(f"Saving model at global step {self.global_step}")
@@ -800,15 +825,44 @@ class FastSACAgent(BaseAlgo):
             # `args.num_learning_iterations` is a multiple of `args.logging_interval`).
             if self.global_step >= args.num_learning_iterations:
                 break
+            if deadline is not None and torch.device(device).type == "cuda":
+                torch.cuda.synchronize()
             self.global_step += 1
             pbar.update(1)
 
         if self.is_main_process:
+            if deadline is not None:
+                if torch.device(device).type == "cuda":
+                    torch.cuda.synchronize()
+                elapsed = time.monotonic() - float(os.environ["HOLOSOMA_RUN_STARTED_MONOTONIC"])
+                budget = deadline - float(os.environ["HOLOSOMA_RUN_STARTED_MONOTONIC"])
+                with open(os.path.join(self.log_dir, "timing.json"), "w") as timing_file:
+                    json.dump(
+                        {
+                            "training_elapsed_wall_time_s": elapsed,
+                            "budget_s": budget,
+                            "overrun_s": max(0.0, elapsed - budget),
+                            "global_step": self.global_step,
+                        },
+                        timing_file,
+                    )
             self.save(os.path.join(self.log_dir, f"model_{self.global_step:07d}.pt"))
             self.export(onnx_file_path=os.path.join(self.log_dir, f"model_{self.global_step:07d}.onnx"))
+            self.writer.flush()
+        pbar.close()
 
     def save(self, path: str) -> None:  # type: ignore[override]
         env_state = self._collect_env_state()
+        metadata = self._checkpoint_metadata(iteration=self.global_step)
+        started = os.environ.get("HOLOSOMA_RUN_STARTED_MONOTONIC")
+        if started is not None:
+            if torch.device(self.device).type == "cuda":
+                torch.cuda.synchronize()
+            snapshot_time = time.monotonic()
+            metadata["elapsed_wall_time_s"] = snapshot_time - float(started)
+            metadata["within_wall_clock_budget"] = snapshot_time <= float(
+                os.environ["HOLOSOMA_RUN_DEADLINE_MONOTONIC"]
+            )
         save_params(
             self.global_step,
             self.actor,
@@ -825,7 +879,7 @@ class FastSACAgent(BaseAlgo):
             path,
             save_fn=self.logging_helper.save_checkpoint_artifact,
             env_state=env_state or None,
-            metadata=self._checkpoint_metadata(iteration=self.global_step),
+            metadata=metadata,
         )
 
     @torch.no_grad()

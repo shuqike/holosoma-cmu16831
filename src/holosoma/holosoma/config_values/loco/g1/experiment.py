@@ -55,4 +55,13 @@ g1_29dof_fast_sac = ExperimentConfig(
     ),
 )
 
-__all__ = ["g1_29dof", "g1_29dof_fast_sac"]
+g1_29dof_fast_sac_sem = replace(
+    g1_29dof_fast_sac,
+    training=replace(g1_29dof_fast_sac.training, name="g1_29dof_fast_sac_sem"),
+    algo=replace(
+        g1_29dof_fast_sac.algo,
+        config=replace(g1_29dof_fast_sac.algo.config, use_actor_sem=True, sem_group_size=64),
+    ),
+)
+
+__all__ = ["g1_29dof", "g1_29dof_fast_sac", "g1_29dof_fast_sac_sem"]

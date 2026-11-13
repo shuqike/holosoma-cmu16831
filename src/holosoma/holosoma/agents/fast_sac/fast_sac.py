@@ -5,6 +5,20 @@ import torch.nn.functional as F
 from torch import nn
 
 
+class SimplicialEmbedding(nn.Module):
+    """Partition hidden features into simplices using a softmax within each group."""
+
+    def __init__(self, group_size: int = 64):
+        super().__init__()
+        if group_size < 2:
+            raise ValueError("SEM group_size must be at least 2")
+        self.group_size = group_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        grouped = x.reshape(*x.shape[:-1], -1, self.group_size)
+        return F.softmax(grouped, dim=-1).reshape_as(x)
+
+
 class Actor(nn.Module):
     def __init__(
         self,
@@ -22,6 +36,8 @@ class Actor(nn.Module):
         action_bias: torch.Tensor | None = None,
         encoder_obs_key: str | None = None,
         encoder_obs_shape: tuple[int, int, int] | None = None,
+        use_actor_sem: bool = False,
+        sem_group_size: int = 64,
     ):
         super().__init__()
         self.obs_indices = obs_indices
@@ -36,6 +52,10 @@ class Actor(nn.Module):
         self.use_layer_norm = use_layer_norm
         self.encoder_obs_key = encoder_obs_key
         self.encoder_obs_shape = encoder_obs_shape
+        self.use_actor_sem = use_actor_sem
+        self.sem_group_size = sem_group_size
+        if use_actor_sem and (sem_group_size < 2 or (hidden_dim // 4) % sem_group_size != 0):
+            raise ValueError("Actor final hidden width must be divisible by sem_group_size (at least 2)")
 
         # Setup the network - this will be overridden in subclasses if needed
         self.setup_network()
@@ -67,7 +87,7 @@ class Actor(nn.Module):
             nn.SiLU(),
             nn.Linear(self.hidden_dim // 2, self.hidden_dim // 4, device=self.device),
             nn.LayerNorm(self.hidden_dim // 4, device=self.device) if self.use_layer_norm else nn.Identity(),
-            nn.SiLU(),
+            SimplicialEmbedding(self.sem_group_size) if self.use_actor_sem else nn.SiLU(),
         )
         self.fc_mu = nn.Sequential(
             nn.Linear(self.hidden_dim // 4, self.n_act, device=self.device),
