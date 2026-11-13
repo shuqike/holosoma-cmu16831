@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/HybridRobotics/supermimic",
+  "commit": "5efbf114e11f725c31d83e217be987c13c0e4ce2",
+  "sha256": {
+    "dependencies/torch_muon.py": "32cbe022bb70cabdbf0bbcd3b46b8a8cda5b764b79b8bf7d5cb3b1da7fcf8ddb",
+    "dependencies/rsl_normalization.py": "4a1ba89ed9385a0c80d082c500832086fbabb756ef96fef5616ec1cc4cefa2af",
+    "src/supermimic/utils/gencoord_helpers.py": "f6808d0082af7063eec79e57c853fd888a5a580d3b7a613c2e5ee0e875400dd5",
+    "src/supermimic/utils/helpers.py": "f99a0b472947fa86e84c0a0996f364d58bfac460bd6dc416ea4d467b29a26885",
+    "src/supermimic/representations.py": "990d1b266731e6172f87771ae9e0df2fa72ac4f169eeed8c534e48ef9943dbd4",
+    "src/supermimic/learners/policy_learner.py": "00388e1caf05bfe059238794dd26408f4dd6f84dafd816cf5dce1d842927493d",
+    "src/supermimic/models.py": "0668c6b66d4c54f9d8a478be6d7a02ecc3328a9b1586b1d84058affe965cf11d"
+  }
+}

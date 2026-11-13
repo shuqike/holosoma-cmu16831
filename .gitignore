@@ -23,3 +23,8 @@ src/holosoma/holosoma/data/robots/converted_rank*/
 # other
 *.egg-info
 __pycache__
+
+# Generated experiment artifacts
+/reports/
+*.pt
+*.pth
