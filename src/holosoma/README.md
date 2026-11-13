@@ -42,6 +42,15 @@ Once checkpoints are saved, you can evaluate policies using [In-Training Evaluat
 
 Train using the MJWarp simulator (GPU-accelerated MuJoCo). **Note: MJWarp support is in beta.**
 
+The setup scripts apply the local `heightfield-contact-v3` fix to the pinned MJWarp dependency.
+It fixes cancellation in heightfield contact interpolation and incorrect capsule witness reconstruction
+in both contact inflation and deep penetration (EPA).
+For an existing environment, run `python scripts/patch_mujoco_warp.py` from the repository root;
+use `--check` to verify it. The patch validates upstream function fingerprints before writing.
+Regression tests are in `tests/test_mjwarp_contacts.py`;
+`bash scripts/validate_mjwarp_nan_fix.sh python` runs the full-scale terrain stability checks.
+See [the fix and validation notes](../../docs/mjwarp-heightfield-contact-fix.md) for details.
+
 ```bash
 # G1 with FastSAC
 source scripts/source_mujoco_setup.sh
@@ -55,8 +64,7 @@ source scripts/source_mujoco_setup.sh
 python src/holosoma/holosoma/train_agent.py \
     exp:g1-29dof \
     simulator:mjwarp \
-    logger:wandb \
-    --terrain.terrain-term.scale-factor=0.5  # required to avoid training instabilities
+    logger:wandb
 
 # T1 with FastSAC -- see the T1 note below
 source scripts/source_mujoco_setup.sh
@@ -71,15 +79,15 @@ python src/holosoma/holosoma/train_agent.py \
     exp:t1-29dof \
     simulator:mjwarp \
     logger:wandb \
-    --terrain.terrain-term.scale-factor=0.5  # required to avoid training instabilities
+    --terrain.terrain-term.scale-factor=0.5  # historical workaround; T1 remains unvalidated with this patch
 
 ```
 
 > **Note:**
 > - MJWarp allocates an average of 96 contacts per environment in a shared pool by default. Adjust it with `--simulator.config.sim.mujoco.warp.nconmax-per-env=128`; the constraint capacity has a separate per-environment limit.
 > - These examples use `--training.num-envs=4096`, but you may need to adjust this value based on your hardware.
-> - When training with PPO on mixed terrain, use `--terrain.terrain-term.scale-factor=0.5` to avoid training instabilities. This applies to G1 as well as T1: at full scale the policy's action distribution goes non-finite within the first few rollouts and training aborts on a device-side assert.
-> - T1 on MJWarp does not currently train, with or without the halved terrain scale. PPO aborts as above, and FastSAC runs roughly 25x slower than the same configuration on G1, which makes a full training run impractical. Only the G1 configurations are covered by the nightly.
+> - With `heightfield-contact-v3`, G1 passed full-scale mixed-terrain checks: three seeds at 512 environments and a stronger-action test at 4096 environments, each for 5000 control steps, plus 100 PPO iterations at 512 environments. These checks establish bounded numerical stability, not full-training convergence. Terrain scaling is no longer required to avoid the reproduced G1 collision failures.
+> - T1 has not been revalidated with this patch. Previously, PPO failed with non-finite action distributions even with halved terrain, and FastSAC ran roughly 25x slower than the same configuration on G1. These T1 limitations remain unresolved; only G1 configurations are covered by the nightly.
 
 Native physics settings use `--simulator.config.sim.mujoco.*`, for example `--simulator.config.sim.mujoco.integrator implicitfast`. Uncommon options use bare upstream names in `mujoco.extra` or `mujoco.warp.extras`; CLI mappings take one JSON object, such as `--simulator.config.sim.mujoco.extra '{"gravity": [0, 0, -2]}'`. Flags and extras expose advanced upstream features that may exceed Holosoma's support. Unset fields preserve existing behavior, and `sim.fps` owns timestep.
 

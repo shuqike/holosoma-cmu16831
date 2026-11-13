@@ -84,7 +84,7 @@ done
 
 # Sentinel files
 SENTINEL_FILE=${VENV_DIR}/.env_uv_setup_finished_hsmujoco_mujoco-${MUJOCO_VERSION}
-WARP_SENTINEL_FILE=${VENV_DIR}/.env_uv_setup_finished_hsmujoco_mujoco-warp-${MUJOCO_WARP_COMMIT}_warp-${WARP_LANG_VERSION}
+WARP_SENTINEL_FILE=${VENV_DIR}/.env_uv_setup_finished_hsmujoco_mujoco-warp-${MUJOCO_WARP_COMMIT}_${MUJOCO_WARP_PATCH_ID}_warp-${WARP_LANG_VERSION}
 
 # Reinstall: remove existing venv and sentinels so all install blocks run fresh
 if [[ "$REINSTALL" == "true" ]] && [[ -d "$VENV_DIR" ]]; then
@@ -227,6 +227,7 @@ if [[ "$INSTALL_WARP" == "true" ]] && [[ ! -f $WARP_SENTINEL_FILE ]]; then
   uv pip install \
     "mujoco-warp[cuda] @ git+https://github.com/google-deepmind/mujoco_warp.git@${MUJOCO_WARP_COMMIT}" \
     "warp-lang==${WARP_LANG_VERSION}" 'numpy>=1.23.5,<2'
+  python "${SCRIPT_DIR}/patch_mujoco_warp.py"
 
   touch $WARP_SENTINEL_FILE
 

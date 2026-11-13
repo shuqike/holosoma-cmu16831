@@ -7,4 +7,7 @@ MUJOCO_VERSION=3.10.0
 # mujoco_warp has no tags or branches. This commit tracks the 3.10.0 line with the batched-camera
 # renderer API (create_render_context/render/get_rgb/get_depth) required by WarpBackend.
 MUJOCO_WARP_COMMIT=ecaef88917a3c90cd238bf76681ca770f58033df
+# Local heightfield barycentric/witness fixes, applied by patch_mujoco_warp.py.
+# Include the patch revision in environment sentinels so existing installs update.
+MUJOCO_WARP_PATCH_ID=heightfield-contact-v3
 WARP_LANG_VERSION=1.15.0
