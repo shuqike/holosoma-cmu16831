@@ -1,5 +1,14 @@
 # Matched seed collection and analysis
 
+Primary figures and timestamp tables now use time-weighted trailing windows;
+see [the corrected postprocessing guide](sem_postprocessing.md). Raw point
+values and plots are retained separately as diagnostics.
+
+For the current configurable-budget protocol and timestamp-specific outputs,
+see [the timed-run guide](sem_timed_runs.md). Defaults below use 900 seconds
+and the new `budget_900s/` directory. The original completed study can still
+be plotted with `--budget 900`; do not mix protocol versions in one comparison.
+
 Wait until the seed-1 job finishes. On EC2, inside tmux:
 
 ```bash
@@ -51,18 +60,19 @@ Create a separate Conda plotting environment outside the Python 3.8 simulator en
 conda create -n holosoma-plots -c conda-forge \
   python=3.11 numpy matplotlib tensorboard pyyaml -y
 conda activate holosoma-plots
-python scripts/plot_sem_comparison.py --input aws-results --seeds 1 2 3 4 5
+python scripts/plot_sem_comparison.py --budget 900 --seeds 1 2 3 4 5
 ```
 
 For an initial comparison after both seed-1 methods finish:
 
 ```bash
-python scripts/plot_sem_comparison.py --input aws-results --seeds 1
+python scripts/plot_sem_comparison.py --budget 900 --seeds 1
 ```
 
 No Holosoma imports, policy inference, or checkpoint deserialization are used.
 The script reads saved YAML/JSON and TensorBoard scalar events. Run from the
-fork root. All outputs go into `aws-results/comparison/` by default.
+fork root. The script infers `aws-results/budget_<budget>s/` from `--budget`
+(default 900 seconds), and writes its `comparison/` subdirectory.
 
 ## Outputs
 

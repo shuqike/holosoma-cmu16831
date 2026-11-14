@@ -155,7 +155,7 @@ class LoggingHelper:
         extra_log_dicts: dict[str, dict[str, float]],
         width: int = 80,
         pad: int = 35,
-    ) -> None:
+    ) -> dict[str, float]:
         """Handle post-epoch logging for training metrics.
 
         This method handles all logging operations after each training epoch, including:
@@ -193,7 +193,7 @@ class LoggingHelper:
         )
 
         # Log to tensorboard
-        self._logging_to_writer(
+        logged_scalars = self._logging_to_writer(
             it=it,
             loss_dict=loss_dict,
             extra_log_dicts=extra_log_dicts,
@@ -224,6 +224,7 @@ class LoggingHelper:
         self.raw_ep_infos.clear()
         self.learn_time = 0.0
         self.collection_time = 0.0
+        return logged_scalars
 
     def _log_episode_info(self) -> tuple[str, dict[str, float]]:
         """Log episode information and return formatted string.
@@ -285,7 +286,7 @@ class LoggingHelper:
         extra_log_dicts: dict[str, dict[str, float]],
         fps: int,
         ep_scalars_to_log: dict[str, float],
-    ) -> None:
+    ) -> dict[str, float]:
         """Log metrics to tensorboard writer.
 
         Parameters
@@ -304,7 +305,7 @@ class LoggingHelper:
             Dictionary containing episode metrics to log.
         """
         if not self.is_main_process:
-            return
+            return {}
         # Log loss metrics
         scalars_to_log: dict[str, float] = {}
         for loss_key, loss_value in loss_dict.items():
@@ -340,6 +341,7 @@ class LoggingHelper:
             self.writer.add_scalar(k, v, global_step=it)
         if wandb.run is not None:
             wandb.log(dict(scalars_to_log, global_step=it), step=it)
+        return scalars_to_log
 
     def _create_console_output(
         self,

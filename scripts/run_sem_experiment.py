@@ -18,6 +18,15 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from .sem_experiment_utils import (
+        DEFAULT_ITERATIONS, PROTOCOL, atomic_json, default_output_root, timestamps, training_source_fingerprint,
+    )
+except ImportError:
+    from sem_experiment_utils import (
+        DEFAULT_ITERATIONS, PROTOCOL, atomic_json, default_output_root, timestamps, training_source_fingerprint,
+    )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -25,14 +34,28 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--seconds", type=float, default=900)
     parser.add_argument("--num-envs", type=int, default=4096)
-    parser.add_argument("--iterations", type=int, default=50000)
+    parser.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS,
+                        help="Safety ceiling; normally the wall-clock budget stops training")
+    parser.add_argument("--timestamps-seconds", type=float, nargs="+",
+                        help="Capture marks; defaults to 900s when in range, plus the end")
+    parser.add_argument("--timestamp-window-seconds", type=float, default=5.0,
+                        help="Log every completed iteration in this window before each mark")
+    parser.add_argument("--logging-interval", type=int, default=100)
+    parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--no-compile", action="store_true")
-    parser.add_argument("--output-root", type=Path, default=Path("logs/sem_experiments"))
+    parser.add_argument("--output-root", type=Path)
     args = parser.parse_args()
     if not math.isfinite(args.seconds) or args.seconds <= 0:
         parser.error("--seconds must be finite and positive")
-    if args.num_envs <= 0 or args.iterations <= 0:
-        parser.error("--num-envs and --iterations must be positive")
+    if args.num_envs <= 0 or args.iterations <= 0 or args.logging_interval <= 0:
+        parser.error("--num-envs, --iterations, and --logging-interval must be positive")
+    if not math.isfinite(args.timestamp_window_seconds) or args.timestamp_window_seconds < 0:
+        parser.error("--timestamp-window-seconds must be finite and nonnegative")
+    try:
+        marks = timestamps(args.seconds, args.timestamps_seconds)
+    except ValueError as error:
+        parser.error(str(error))
+    args.output_root = args.output_root or default_output_root(args.seconds)
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         parser.error("Run one experiment on one GPU; do not launch with torchrun")
 
@@ -57,7 +80,7 @@ def main() -> int:
         "--training.project", "cmu16831-sem", "--training.name", f"{args.variant}_seed{args.seed}",
         "--terrain.terrain-term.scale-factor", "1.0",
         "--algo.config.num-learning-iterations", str(args.iterations),
-        "--algo.config.save-interval", "1000", "--algo.config.logging-interval", "100",
+        "--algo.config.save-interval", "1000", "--algo.config.logging-interval", str(args.logging_interval),
     ]
     if args.no_compile:
         # 9c238cf8 uses tyro.conf.FlagConversionOff: booleans require an explicit value.
@@ -75,6 +98,10 @@ def main() -> int:
                 target = run_dir / "source" / source.relative_to(repo)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(source.read_bytes())
+    source = repo / "src/holosoma/holosoma/agents/fast_sac/timed_experiment.py"
+    target = run_dir / "source" / source.relative_to(repo)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(source.read_bytes())
     gpu = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=False)
     (run_dir / "nvidia-smi.txt").write_text(gpu.stdout + gpu.stderr)
 
@@ -89,7 +116,11 @@ def main() -> int:
         "base_revision": base_revision, "simulator": "Isaac Gym Preview 4",
         "budget_s": args.seconds, "command": command, "python": sys.version,
         "torch_compile_cache": "cold", "simulator_cache": "shared",
-        "smoke_test": args.num_envs != 4096 or args.iterations != 50000 or args.no_compile or args.seconds != 900,
+        "smoke_test": args.smoke_test or args.num_envs != 4096 or args.no_compile,
+        "protocol": PROTOCOL, "timestamps_s": marks,
+        "training_source_sha256": training_source_fingerprint(repo),
+        "timestamp_window_s": args.timestamp_window_seconds,
+        "logging_interval": args.logging_interval, "iteration_limit": args.iterations,
         "timing": "training interpreter launch through cooperative stop; cleanup/export timed separately by duration",
         "status": "running",
     }
@@ -98,7 +129,10 @@ def main() -> int:
     metadata["started_unix_s"] = time.time()
     env["HOLOSOMA_RUN_STARTED_MONOTONIC"] = str(started)
     env["HOLOSOMA_RUN_DEADLINE_MONOTONIC"] = str(started + args.seconds)
-    (run_dir / "run.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    env["HOLOSOMA_RUN_BUDGET_SECONDS"] = str(args.seconds)
+    env["HOLOSOMA_TIMESTAMPS_SECONDS"] = json.dumps(marks)
+    env["HOLOSOMA_TIMESTAMP_WINDOW_SECONDS"] = str(args.timestamp_window_seconds)
+    atomic_json(run_dir / "run.json", metadata)
     with (run_dir / "console.log").open("w") as log:
         process = subprocess.Popen(command, cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -111,9 +145,7 @@ def main() -> int:
         return_code=return_code,
         process_duration_s=time.monotonic() - started,
     )
-    temporary = run_dir / "run.json.tmp"
-    temporary.write_text(json.dumps(metadata, indent=2) + "\n")
-    temporary.replace(run_dir / "run.json")
+    atomic_json(run_dir / "run.json", metadata)
     print(f"Exit code {return_code}; outputs: {run_dir}", flush=True)
     if return_code != 0:
         print("Last 60 lines of console.log:", flush=True)

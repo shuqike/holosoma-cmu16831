@@ -14,6 +14,7 @@ from loguru import logger
 
 from holosoma.agents.base_algo.base_algo import BaseAlgo
 from holosoma.agents.fast_sac.fast_sac import Actor, CNNActor, CNNCritic, Critic
+from holosoma.agents.fast_sac.timed_experiment import TimedExperimentRecorder
 from holosoma.agents.fast_sac.fast_sac_utils import (
     EmpiricalNormalization,
     SimpleReplayBuffer,
@@ -664,6 +665,11 @@ class FastSACAgent(BaseAlgo):
         deadline = float(deadline_text) if deadline_text is not None else None
         if deadline is not None and self.is_multi_gpu:
             raise ValueError("The timed SEM launcher supports single-GPU training only")
+        timed_recorder = TimedExperimentRecorder.from_environment(self.log_dir)
+        collected_rollouts = last_logged_rollouts = 0
+        budget_reached_elapsed = None
+        if timed_recorder is not None:
+            timed_recorder.publish()
         if args.compile:
             update_main = torch.compile(self._update_main)
             update_pol = torch.compile(self._update_pol)
@@ -743,6 +749,7 @@ class FastSACAgent(BaseAlgo):
                 critic_obs = next_critic_obs
 
                 rb.extend(transition)
+                collected_rollouts += 1
 
             # NOTE: args.batch_size is the global batch size
             batch_size = max(args.batch_size // env.num_envs // self.gpu_world_size, 1)
@@ -790,7 +797,14 @@ class FastSACAgent(BaseAlgo):
                             torch._foreach_mul_(tgt_ps, 1.0 - args.tau)
                             torch._foreach_add_(tgt_ps, src_ps, alpha=args.tau)
 
-                if self.global_step % args.logging_interval == 0:
+                if timed_recorder is not None and torch.device(device).type == "cuda":
+                    torch.cuda.synchronize()
+                observation_elapsed = timed_recorder.elapsed() if timed_recorder is not None else None
+                if timed_recorder is not None and observation_elapsed >= timed_recorder.budget:
+                    budget_reached_elapsed = observation_elapsed
+                timestamp_logging = timed_recorder is not None and timed_recorder.should_log(observation_elapsed)
+                if (self.global_step % args.logging_interval == 0 or timestamp_logging
+                        or self.global_step >= args.num_learning_iterations):
                     with torch.no_grad():
                         # Use accumulated training metrics for smoother logging (reduces noise)
                         accumulated_metrics = self.training_metrics.mean_and_clear()
@@ -807,13 +821,32 @@ class FastSACAgent(BaseAlgo):
                         loss_dict["env_rewards"] = rewards.mean().item()
 
                     # Use logging helper
-                    self.logging_helper.post_epoch_logging(it=self.global_step, loss_dict=loss_dict, extra_log_dicts={})
+                    if timed_recorder is not None:
+                        # Extra timestamp records must not advance the counter by a
+                        # whole regular logging interval. Count actual rollouts.
+                        self.logging_helper.num_steps_per_env = collected_rollouts - last_logged_rollouts
+                    logged_scalars = self.logging_helper.post_epoch_logging(
+                        it=self.global_step, loss_dict=loss_dict, extra_log_dicts={}
+                    )
+                    last_logged_rollouts = collected_rollouts
                     started_text = os.environ.get("HOLOSOMA_RUN_STARTED_MONOTONIC")
                     if started_text is not None:
+                        logged_elapsed = (observation_elapsed if timed_recorder is not None
+                                          else time.monotonic() - float(started_text))
                         self.writer.add_scalar(
-                            "Timing/elapsed_wall_time_s", time.monotonic() - float(started_text), self.global_step
+                            "Timing/elapsed_wall_time_s", logged_elapsed, self.global_step
                         )
-                if args.save_interval > 0 and self.global_step > 0 and self.global_step % args.save_interval == 0:
+                        if timed_recorder is not None:
+                            logged_scalars["Timing/elapsed_wall_time_s"] = logged_elapsed
+                            timed_recorder.observe(self.global_step, logged_elapsed, logged_scalars)
+                if timed_recorder is not None and budget_reached_elapsed is None:
+                    capture_elapsed = timed_recorder.elapsed()
+                    if capture_elapsed >= timed_recorder.budget:
+                        budget_reached_elapsed = capture_elapsed
+                captured_timestamp = (timed_recorder.capture_due(self.global_step, self.save, self.export)
+                                      if timed_recorder is not None else False)
+                if (not captured_timestamp and args.save_interval > 0 and self.global_step > 0
+                        and self.global_step % args.save_interval == 0 and budget_reached_elapsed is None):
                     if self.is_main_process:
                         logger.info(f"Saving model at global step {self.global_step}")
                         self.save(os.path.join(self.log_dir, f"model_{self.global_step:07d}.pt"))
@@ -823,7 +856,7 @@ class FastSACAgent(BaseAlgo):
             # saved at exactly args.num_learning_iterations. In the `while` condition, we check for self.global_step <=
             # args.num_learning_iterations, so that we have complete logging data at the final step too (assuming
             # `args.num_learning_iterations` is a multiple of `args.logging_interval`).
-            if self.global_step >= args.num_learning_iterations:
+            if self.global_step >= args.num_learning_iterations or budget_reached_elapsed is not None:
                 break
             if deadline is not None and torch.device(device).type == "cuda":
                 torch.cuda.synchronize()
@@ -831,11 +864,24 @@ class FastSACAgent(BaseAlgo):
             pbar.update(1)
 
         if self.is_main_process:
+            # Freeze the training clock before final artifact I/O. Intermediate
+            # timestamp exports count toward training; final export is cleanup.
+            if deadline is not None and torch.device(device).type == "cuda":
+                torch.cuda.synchronize()
+            training_finished_elapsed = None
+            if deadline is not None:
+                training_finished_elapsed = budget_reached_elapsed
+                if training_finished_elapsed is None:
+                    training_finished_elapsed = time.monotonic() - float(os.environ["HOLOSOMA_RUN_STARTED_MONOTONIC"])
+            if timed_recorder is not None:
+                timed_recorder.capture_due(self.global_step, self.save, self.export)
             if deadline is not None:
                 if torch.device(device).type == "cuda":
                     torch.cuda.synchronize()
-                elapsed = time.monotonic() - float(os.environ["HOLOSOMA_RUN_STARTED_MONOTONIC"])
-                budget = deadline - float(os.environ["HOLOSOMA_RUN_STARTED_MONOTONIC"])
+                elapsed = training_finished_elapsed
+                budget = float(os.environ.get("HOLOSOMA_RUN_BUDGET_SECONDS", str(
+                    deadline - float(os.environ["HOLOSOMA_RUN_STARTED_MONOTONIC"])
+                )))
                 with open(os.path.join(self.log_dir, "timing.json"), "w") as timing_file:
                     json.dump(
                         {
@@ -843,15 +889,19 @@ class FastSACAgent(BaseAlgo):
                             "budget_s": budget,
                             "overrun_s": max(0.0, elapsed - budget),
                             "global_step": self.global_step,
+                            "stop_reason": "wall_clock_budget" if elapsed >= budget else "iteration_limit",
                         },
                         timing_file,
                     )
-            self.save(os.path.join(self.log_dir, f"model_{self.global_step:07d}.pt"))
-            self.export(onnx_file_path=os.path.join(self.log_dir, f"model_{self.global_step:07d}.onnx"))
+            if timed_recorder is None or timed_recorder.last_saved_step != self.global_step:
+                self.save(os.path.join(self.log_dir, f"model_{self.global_step:07d}.pt"))
+                self.export(onnx_file_path=os.path.join(self.log_dir, f"model_{self.global_step:07d}.onnx"))
+            if timed_recorder is not None:
+                timed_recorder.publish(finished=True)
             self.writer.flush()
         pbar.close()
 
-    def save(self, path: str) -> None:  # type: ignore[override]
+    def save(self, path: str) -> dict:  # type: ignore[override]
         env_state = self._collect_env_state()
         metadata = self._checkpoint_metadata(iteration=self.global_step)
         started = os.environ.get("HOLOSOMA_RUN_STARTED_MONOTONIC")
@@ -881,6 +931,7 @@ class FastSACAgent(BaseAlgo):
             env_state=env_state or None,
             metadata=metadata,
         )
+        return metadata
 
     @torch.no_grad()
     def get_example_obs(self):

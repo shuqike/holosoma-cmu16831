@@ -96,6 +96,34 @@ def test_legacy_scene_cli_preserves_empty_defaults() -> None:
     assert scene.rigid_objects is None
 
 
+def test_timed_diagnostics_serialize_real_torch_and_numpy_scalars(tmp_path: Path) -> None:
+    import json
+    import numpy as np
+
+    from holosoma.agents.fast_sac.timed_experiment import TimedExperimentRecorder
+
+    recorder = TimedExperimentRecorder(tmp_path, 0, 900, [900])
+    recorder.observe(100, 90.0, {
+        "Env/penalty_scale": torch.tensor(0.5, requires_grad=True),
+        "Train/mean_episode_length": np.float32(31.5),
+        "Train/num_samples": np.int64(6464),
+    })
+    recorder.publish()
+    saved = json.loads((tmp_path / "observations.jsonl").read_text())
+    assert saved["scalars"] == {
+        "Env/penalty_scale": 0.5, "Train/mean_episode_length": 31.5, "Train/num_samples": 6464,
+    }
+    assert not isinstance(recorder.latest["scalars"]["Env/penalty_scale"], torch.Tensor)
+
+
+def test_timed_diagnostics_reject_vector_tensors(tmp_path: Path) -> None:
+    from holosoma.agents.fast_sac.timed_experiment import TimedExperimentRecorder
+
+    recorder = TimedExperimentRecorder(tmp_path, 0, 900, [900])
+    with pytest.raises(ValueError, match="one scalar"):
+        recorder.observe(1, 1, {"Env/vector": torch.ones(2)})
+
+
 def test_sem_onnx_actions_match_pytorch(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     ort = pytest.importorskip("onnxruntime")

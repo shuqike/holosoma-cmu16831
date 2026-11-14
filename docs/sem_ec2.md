@@ -1,5 +1,10 @@
 # FastSAC + actor-only SEM on EC2
 
+For configurable run lengths, requested timestamps, and the current default
+budget-specific output folders, see [the timed-run guide](sem_timed_runs.md).
+The infrastructure setup below still applies. The original completed
+15-minute results are preserved separately from newly collected runs.
+
 The `experiment/fastsac+sem` branch is based on **Holosoma 9c238cf8** and uses
 **Isaac Gym Preview 4**. Do not use the former IsaacSim setup instructions.
 The SEM preset preserves the G1 FastSAC task and replaces only the last actor

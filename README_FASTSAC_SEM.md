@@ -1,441 +1,277 @@
-# FastSAC + SEM: CMU 16-831 experiment branch
+# FastSAC + SEM
 
-This branch studies whether adding **simplicial embeddings (SEM) to the
-FastSAC actor** improves humanoid walking under a fixed training budget.
-The comparison is FastSAC versus FastSAC + actor-only SEM on the Unitree G1
-29-DoF velocity-tracking task. Both methods run in the same Holosoma checkout,
-with the same task, hardware, and experiment instrumentation.
+This branch compares FastSAC with FastSAC + actor-only simplicial embeddings
+(SEM) on the Unitree G1 29-DoF velocity-tracking task. It measures learning
+under matched wall-clock budgets using Holosoma revision `9c238cf8` and
+Isaac Gym Preview 4.
 
-The branch is based on Holosoma revision
-**`9c238cf80f531c0e65d818348c3c1a5cc2764f5b`** (`9c238cf8`). Its training
-backend is **Isaac Gym Preview 4**. Training runs on an AWS Linux GPU
-instance.
-This README describes the experiment implementation and collection protocol
+## References
 
-## Research context and references
+- Seo et al., [*Learning Sim-to-Real Humanoid Locomotion in 15 Minutes*](https://arxiv.org/abs/2512.01996): FastSAC and the humanoid learning setup. [Holosoma repository](https://github.com/amazon-far/holosoma).
+- Obando-Ceron et al., [*Simplicial Embeddings Improve Sample Efficiency in Actor-Critic Agents*](https://arxiv.org/abs/2510.13704): the representation method used for the actor extension.
 
-1. **Younggyo Seo, Carmelo Sferrazza, Juyue Chen, Guanya Shi, Rocky Duan,
-   and Pieter Abbeel (2025).**
-   [*Learning Sim-to-Real Humanoid Locomotion in 15 Minutes*](https://arxiv.org/abs/2512.01996).
-   The paper develops FastSAC/FastTD3 recipes for fast humanoid learning with
-   massively parallel simulation. Holosoma provides the training framework.
-   [Project page](https://younggyo.me/fastsac-humanoid/) ·
-   [Upstream code](https://github.com/amazon-far/holosoma).
-2. **Johan Obando-Ceron, Walter Mayor, Samuel Lavoie, Scott Fujimoto,
-   Aaron Courville, and Pablo Samuel Castro (2025 preprint; revised 2026).**
-   [*Simplicial Embeddings Improve Sample Efficiency in Actor-Critic Agents*](https://arxiv.org/abs/2510.13704).
-   SEM constrains learned features to groups of probability-simplex vectors.
-   This paper motivates the representation change tested here.
+## Algorithm
 
-Our implementation is a dimension-preserving, actor-only adaptation of SEM.
-It does not reproduce every architectural choice or benchmark in the SEM
-paper, nor the full sim-to-real evaluation in the Holosoma paper. Published
-FastSAC curves provide context; a locally collected FastSAC baseline controls
-for this checkout, GPU, environment, and timing protocol.
-
-## What changes in the learning algorithm?
-
-FastSAC remains the off-policy actor-critic learner. Its replay buffer,
-distributional critics, update rules, entropy tuning, optimizer settings,
-observation normalization, and task settings are inherited from the baseline.
-The intervention replaces the **last actor trunk activation**:
+SEM replaces the final SiLU activation in the FastSAC actor trunk:
 
 ```text
-FastSAC:       observation -> 512 -> 256 -> 128 -> SiLU -> mean/log-std heads
-FastSAC + SEM: observation -> 512 -> 256 -> 128 -> SEM  -> mean/log-std heads
+FastSAC:       observations -> 512 -> 256 -> 128 -> SiLU -> mean/log-std heads
+FastSAC + SEM: observations -> 512 -> 256 -> 128 -> SEM  -> mean/log-std heads
 
-SEM: reshape 128 features into (2, 64)
-     -> softmax within each group of 64
-     -> flatten back to 128
+SEM: reshape 128 features into two groups of 64
+     -> softmax within each group
+     -> flatten to 128 features
 ```
 
-The diagram omits the earlier activations and layer normalization, which are
-preserved. For each group, SEM computes `exp(z_i) / sum_j exp(z_j)`;
-the coordinates are nonnegative and sum to one. Both Gaussian output heads
-consume the resulting features. SEM introduces **no additional trainable
-parameters**, although its operation can still affect runtime.
+Earlier activations and layer normalization are preserved. Each SEM group
+has nonnegative coordinates that sum to one. SEM adds no trainable parameters.
+The critics, replay buffer, optimizers, entropy tuning, and task are shared
+between methods. This is a dimension-preserving, actor-only adaptation of SEM.
 
-The configuration fields are `use_actor_sem` (default `False`) and
-`sem_group_size` (default `64`). The final hidden width must be divisible by
-the group size, which must be at least two. The new
-`exp:g1-29dof-fast-sac-sem` preset inherits `exp:g1-29dof-fast-sac` and enables
-SEM. Because SEM has no weights of its own, the checkpoint loader explicitly
-checks SEM settings instead of relying only on matching parameter shapes.
+The `exp:g1-29dof-fast-sac-sem` preset enables `use_actor_sem=True` with
+`sem_group_size=64`. The baseline preset is `exp:g1-29dof-fast-sac`.
+The group size must be at least two and divide the final hidden width.
+Checkpoint loading checks SEM settings because parameter shapes alone do
+not distinguish the actors.
 
-Other branch changes support the experiment:
-
-| Area | Implementation |
+| Component | File under `src/holosoma/holosoma/` |
 |---|---|
-| Actor representation | `src/holosoma/holosoma/agents/fast_sac/fast_sac.py` |
-| Configuration and preset registration | `config_types/algo.py`, `config_values/loco/g1/experiment.py`, `config_values/experiment.py` under `src/holosoma/holosoma/` |
-| Startup-inclusive deadline, timing logs, checkpoint metadata | `src/holosoma/holosoma/agents/fast_sac/fast_sac_agent.py` |
-| Atomic checkpoint publication for live syncing | `src/holosoma/holosoma/agents/modules/logging_utils.py` |
-| Legacy Tyro parser compatibility | `src/holosoma/holosoma/config_types/simulator.py` |
-| Collection, syncing, analysis, and tests | Scripts and test files described below |
+| Actor and SEM layer | `agents/fast_sac/fast_sac.py` |
+| Algorithm configuration | `config_types/algo.py` |
+| Experiment presets | `config_values/loco/g1/experiment.py`, `config_values/experiment.py` |
+| Training and checkpoint timing | `agents/fast_sac/fast_sac_agent.py` |
+| Timestamp collection | `agents/fast_sac/timed_experiment.py` |
+| Atomic PT checkpoint saving | `agents/modules/logging_utils.py` |
 
-The Tyro fix hides optional scene-file and rigid-object lists from CLI
-expansion while retaining their Python configuration fields and `None`
-defaults. It resolves parser construction on this legacy checkout without
-adding scene assets or changing the locomotion task.
-
-## Experiment protocol
+## Experiment settings
 
 | Setting | Value |
 |---|---|
-| Base checkout | Holosoma `9c238cf8` plus this branch's changes |
-| Robot and task | Unitree G1, 29 DoF, commanded velocity tracking |
+| Task | G1 29-DoF commanded velocity tracking |
 | Simulator | Isaac Gym Preview 4, headless |
 | Parallel environments | 4,096 |
 | Terrain | Default mixed terrain, `scale_factor=1.0` |
-| Perturbations | Default random pushes and domain randomization enabled |
-| Observations | Existing state observations; no camera/CNN input |
-| Budget | 900 seconds, including training interpreter/simulator startup |
-| Methods | `baseline` = FastSAC; `sem` = FastSAC + actor-only SEM |
-| Seeds | Matched seeds 1, 2, 3, 4, 5 |
-| Execution | One GPU, one training process at a time |
-| Compilation caches | Fresh Torch/Triton cache per run; shared simulator caches |
-| Logging | Local TensorBoard and files; W&B/video disabled |
-| Logging/checkpoint intervals | Every 100 / 1,000 learner iterations |
+| Perturbations | Random pushes and domain randomization enabled |
+| Observations | State observations; no camera input |
+| Methods | `baseline` = FastSAC; `sem` = FastSAC + SEM |
+| Budget | Configurable with `--seconds`; default 900 seconds |
+| Timestamps | Configurable; run end is always included |
+| Logging | TensorBoard and files; W&B and video disabled |
+| Regular logging / checkpoints | Every 100 / 1,000 iterations |
+| Timestamp window | Dense logging in the preceding 5 seconds, with PT/ONNX captures |
+| Execution | One GPU and one training process at a time |
+| Caches | Fresh Torch/Triton cache per run; shared simulator caches |
 
-Keep the hardware, package environment, code, and task configuration fixed
-across methods and seeds. Warm shared simulator caches using the same smoke
-checks before measured collection. Seeds are matched experimental replicates;
-different methods will still produce different trajectories.
+Keep hardware, dependencies, task settings, and capture schedules fixed
+across methods. Use matched seeds. The batch alternates which method runs
+first by position in the supplied seed list.
 
-The launcher sets a 50,000-iteration ceiling; the wall-clock deadline normally
-stops training first. The batch orders seeds 2–5 as follows:
+The budget includes interpreter startup, imports, simulator initialization,
+compilation, and training. Instance boot and installation are outside it.
+Training stops between iterations, so the actual stop can be slightly late.
+Final save/export and cleanup extend process duration.
 
-| Seed | First | Second |
-|---|---|---|
-| 2 | FastSAC | FastSAC + SEM |
-| 3 | FastSAC + SEM | FastSAC |
-| 4 | FastSAC | FastSAC + SEM |
-| 5 | FastSAC + SEM | FastSAC |
-
-Seed 1 is collected separately. The remaining eight runs require two hours
-of training budgets, plus final exports and cleanup.
-
-### What the 15-minute budget means
-
-The clock starts immediately before the training interpreter is launched.
-Imports, simulator initialization, compilation, and training count toward it.
-EC2 boot, package installation, and the launcher's initial provenance capture
-are outside it. The learner checks the deadline between iterations and
-synchronizes CUDA work for timed runs. An ongoing iteration or export can
-cross the deadline; this is a cooperative stop, not a hard process kill.
-
-`timing.json` records training elapsed time and overrun. `run.json` records
-the longer process duration including final save/export/cleanup. Checkpoint
-metadata records `elapsed_wall_time_s` and `within_wall_clock_budget`.
-For a strict policy-at-budget comparison, select the latest checkpoint with
-that flag set to true. The final checkpoint can be over budget, and periodic
-checkpoint spacing can leave a substantial gap before the deadline.
+Timestamp records include actual capture times and eligibility. For a strict
+policy-at-budget comparison, use an eligible pre-target checkpoint. Boundary
+and final checkpoints can be late. Filenames identify iteration counters,
+not environment transitions.
 
 ## Environment setup
 
-All commands below assume the repository root unless stated otherwise.
+Commands assume the repository root. Training uses Python 3.8 in `hsgym`.
+Plotting uses Python 3.11 and does not require Holosoma, Isaac Gym, or CUDA.
 
-### AWS training machine
+### Training
 
-The collection workflow uses a **g6e.2xlarge**, with one NVIDIA L40S GPU
-(48 GB), 8 vCPUs, and 64 GiB RAM, and a 200 GiB gp3 root volume. An approved
-8-vCPU G/VT quota accommodates one such instance. Use the same instance type
-for the baseline and SEM; changing hardware requires a new matched comparison.
-
-The selected image for this experiment is the **Deep Learning Base AMI with
-Single CUDA (Ubuntu 24.04), x86_64**, identified in the original launch choice
-as `ami-03c172464e77cac8c`. AMI IDs depend on region and release; verify the
-AWS publisher and x86 architecture in your region. See the
-[AWS DLAMI release notes](https://docs.aws.amazon.com/dlami/latest/devguide/appendix-ami-release-notes.html).
-Keep the image's GPU driver. The installer creates a separate Python 3.8
-environment rather than using an AMI-provided ML environment.
-
-Preview 4 is legacy software whose original
-[NVIDIA prerequisites](https://developer.nvidia.com/isaac-gym/download)
-list Ubuntu 18.04/20.04. Ubuntu 24.04 is the environment used for this project's
-successful integration/full-run checks; that does not establish general
-compatibility for arbitrary package versions. The historical installer has
-unlocked dependencies, so preserve a working environment for all replicates.
-
-On EC2, after uploading this checkout:
+The AWS configuration is a `g6e.2xlarge`: one NVIDIA L40S GPU (48 GB),
+8 vCPUs, 64 GiB RAM, and a 200 GiB gp3 volume. Use the x86_64 Deep Learning
+Base AMI with Single CUDA (Ubuntu 24.04) and retain its GPU driver.
+See [the EC2 guide](docs/sem_ec2.md) for launch and dependency details.
 
 ```bash
-nvidia-smi
-sudo apt-get update
-sudo apt-get install -y tmux rsync git wget curl build-essential cmake \
-  libgl1 libegl1 libvulkan1 libglib2.0-0t64 libxrender1 libxi6 libxrandr2
+sudo apt-get update && sudo apt-get install -y tmux rsync git wget curl build-essential cmake libgl1 libegl1 libvulkan1 libglib2.0-0t64 libxrender1 libxi6 libxrandr2
+```
 
-tmux new -s sem
-cd ~/holosoma-cmu16831
-set -o pipefail
-bash scripts/setup_isaacgym.sh 2>&1 | tee setup-isaacgym.log
+```bash
+set -o pipefail && bash scripts/setup_isaacgym.sh 2>&1 | tee setup-isaacgym.log
+```
+
+The installer creates `hsgym` under `~/.holosoma_deps/miniconda3` and installs
+Isaac Gym Preview 4 and the repository. Source it in each training shell:
+
+```bash
 source scripts/source_isaacgym_setup.sh
 ```
 
-`setup_isaacgym.sh` creates Python 3.8 environment `hsgym` under
-`~/.holosoma_deps/miniconda3`, installs Isaac Gym Preview 4 and this checkout,
-and writes a setup sentinel under `~/.holosoma_deps`. Source
-`source_isaacgym_setup.sh` in each new training shell. Do not replace it with
-the IsaacSim setup or a plotting environment. Inspect setup failures before
-launching experiments; long streams of old boto3 metadata can indicate pip
-resolver backtracking. Reuse a known working dependency set rather than
-changing the experimental algorithm to resolve installation problems.
-
-Optionally capture package versions from the working training environment:
+Preserve dependency versions across runs. Save environment records with results:
 
 ```bash
-conda list --explicit > training-conda-explicit.txt
-python -m pip freeze > training-pip-freeze.txt
+conda list --explicit > training-conda-explicit.txt && python -m pip freeze > training-pip-freeze.txt
 ```
 
-These are supplementary reproducibility records; the launcher does not
-automatically capture a complete dependency lock. Keep them with your results.
-
-### Mac plotting environment: Conda
-
-Plotting does not require Holosoma, Isaac Gym, CUDA, or loading a policy.
-Use a separate Conda environment with your existing Miniconda installation:
+### Plotting
 
 ```bash
-conda create -n holosoma-plots -c conda-forge \
-  python=3.11 numpy matplotlib tensorboard pyyaml -y
-conda activate holosoma-plots
+conda create -n holosoma-plots -c conda-forge python=3.11 numpy matplotlib tensorboard pyyaml pytest -y && conda activate holosoma-plots
 ```
 
-Subsequent sessions only need `conda activate holosoma-plots`.
+## Workflow
 
-## Scripts and end-to-end workflow
+### Transfer
 
-### 1. Upload the branch to EC2
-
-Configure a local SSH alias named `holosoma-aws` with the instance IP,
-`User ubuntu`, and your private-key path. Complete an interactive SSH
-connection before starting unattended syncing. From the local repository:
+Configure SSH alias `holosoma-aws` and verify access. Upload the checkout,
+including `.git` for source records:
 
 ```bash
-ssh holosoma-aws 'mkdir -p ~/holosoma-cmu16831/logs/sem_experiments'
-rsync -az --exclude='logs/' --exclude='aws-results/' \
-  --exclude='.venv/' --exclude='.venv-plots/' --exclude='__pycache__/' \
-  --exclude='.DS_Store' ./ holosoma-aws:holosoma-cmu16831/
+ssh holosoma-aws 'mkdir -p ~/holosoma-cmu16831/logs/sem_experiments' && rsync -az --exclude='logs/' --exclude='aws-results/' --exclude='.venv/' --exclude='.venv-plots/' --exclude='__pycache__/' --exclude='.DS_Store' ./ holosoma-aws:holosoma-cmu16831/
 ```
 
-The upload includes `.git`: the launcher records and verifies Git provenance.
-Use a fresh destination when switching from a newer Holosoma checkout, since
-rsync without deletion can leave obsolete files. Full SSH and EC2 details
-are in [the EC2 guide](docs/sem_ec2.md).
-
-### 2. Validate integration and collect seed 1: EC2
-
-`scripts/run_sem_experiment.py` launches one timed training process. It has
-only standard-library imports and records the run command, source changes,
-GPU information, budget, and completion status. The defaults are the measured
-4096-environment, compiled, 900-second setup; `--variant` defaults to `sem`.
-
-First run the two small checks in the activated training environment:
+Use tmux on the training instance to keep runs active after SSH disconnects:
 
 ```bash
-python scripts/run_sem_experiment.py \
-  --num-envs 64 --iterations 20 --seconds 300 --no-compile
-python scripts/run_sem_experiment.py \
-  --num-envs 64 --iterations 20 --seconds 300
+tmux new -s sem
 ```
 
-These runs are marked `smoke_test: true` and excluded from the comparison.
-Check each printed exit code and output directory. Then collect the seed-1
-pair sequentially, if it has not already been collected:
+### Integration checks
+
+`scripts/run_sem_experiment.py` launches one run and records its command,
+source, GPU, timing, and completion status. In the training environment:
 
 ```bash
-python scripts/run_sem_experiment.py --variant baseline --seed 1 --seconds 900
-python scripts/run_sem_experiment.py --variant sem --seed 1 --seconds 900
+python scripts/run_sem_experiment.py --num-envs 64 --iterations 20 --seconds 300 --no-compile && python scripts/run_sem_experiment.py --num-envs 64 --iterations 20 --seconds 300
 ```
 
-Each invocation creates a fresh timestamped directory; the single-run launcher
-does not skip earlier successful runs. Do not repeat an already complete
-seed-1 pair unintentionally. Detach tmux with Ctrl-b, then d; reconnect using
-`tmux attach -t sem`. Closing SSH leaves tmux training active.
+These runs are marked as smoke tests and excluded from analysis.
 
-### 3. Collect only remaining pairs: EC2
+### Matched runs
 
-`scripts/run_matched_sem_seeds.sh` activates `hsgym`, runs seeds 2–5 in the
-alternating order above, and stops on the first failure. It is self-contained
-apart from the existing setup and single-run launcher scripts.
+`scripts/run_matched_sem_seeds.sh` activates the training environment and
+collects paired runs sequentially. For five seeds at 15 minutes:
 
 ```bash
-bash scripts/run_matched_sem_seeds.sh --status
-bash scripts/run_matched_sem_seeds.sh
+bash scripts/run_matched_sem_seeds.sh --seconds 900 --seeds 1 2 3 4 5
 ```
 
-`--status` prints completed/pending pairs without starting training. On later
-invocations, completed pairs are skipped. Completion requires compatible
-full-run metadata, successful exit, at least 900 seconds of recorded training
-time, final nonempty PT/ONNX artifacts, and a TensorBoard event file. Smoke
-tests and differently configured runs do not fill a pair.
-
-An interrupted/failed pair receives a **fresh run and fresh budget** on the
-next invocation, preserving old attempts. Existing checkpoints omit replay
-contents and full RNG state, so resuming them would not reproduce an
-uninterrupted timed replicate. A lock prevents duplicate batch scripts;
-the script also checks for active launchers/trainers in this checkout.
-Keep the source/environment fixed across retries. Duplicate completed runs
-are reported, not deleted or automatically selected for plotting.
-
-### 4. Pull results continuously: Mac
-
-`scripts/sync_ec2_results.sh` polls every 30 seconds, pulling the remote
-`~/holosoma-cmu16831/logs/sem_experiments/` into local `aws-results/`.
-It retries connection failures and excludes compilation caches and temporary
-checkpoint files. The script needs SSH/rsync, not a Conda environment.
-
-In a separate local terminal, start this before measured training:
+For 30 minutes with captures at 15 and 30 minutes:
 
 ```bash
-caffeinate -is /bin/bash scripts/sync_ec2_results.sh
+bash scripts/run_matched_sem_seeds.sh --seconds 1800 --seeds 1 2 3 4 5 --timestamps-seconds 900 1800
 ```
 
-`caffeinate` stays attached to the sync process and releases its assertions
-when it exits. Keep the Mac plugged in with its lid open; screen locking is
-fine. The loop omits ONNX files because export is not atomic. PT checkpoints
-are published atomically; console/event files are refreshed snapshots.
-An optional positional argument replaces the default SSH alias.
+Durations and timestamps are arbitrary positive seconds; timestamps must
+fall within the budget. Add `--status` to inspect completion without training.
+Keep the seed-list order stable across retries. Defaults are 900 seconds and
+seeds 2–5; the commands above specify all seeds.
 
-After all training exits, stop the loop with Ctrl-C and run a final pull
-that includes ONNX outputs:
+The batch skips compatible completed runs, preserves failed attempts, and
+starts incomplete combinations from scratch. Checks include budget, schedule,
+logging settings, protocol, and training source fingerprint. Checkpoints omit
+replay contents and full RNG state, so retries receive a fresh budget.
+The script stops on failure and prevents concurrent training.
+
+A single run always creates a fresh attempt:
 
 ```bash
-caffeinate -is /bin/bash scripts/sync_ec2_results.sh --once
+python scripts/run_sem_experiment.py --variant sem --seed 1 --seconds 1800 --timestamps-seconds 900 1800
 ```
 
-Neither the sync script nor training completion stops EC2 billing. Stop the
-instance after verifying the final download; retained EBS storage still bills.
+Outputs default to `logs/sem_experiments/budget_<seconds>s/`.
+Use `--output-root` to separate studies that share a budget.
 
-### 5. Plot matched results: Mac
+### Sync
 
-`scripts/plot_sem_comparison.py` reads JSON/YAML and TensorBoard events. It
-checks that paired task/optimizer configurations agree apart from run identity
-and the intended SEM flag, and that base revision, Python, simulator, and cache
-policies match. It rejects missing pairs and duplicate successful runs.
-Verify matching GPU hardware separately using each run's `nvidia-smi.txt`.
+`scripts/sync_ec2_results.sh` pulls results into `aws-results/` every
+30 seconds and retries connection failures:
 
 ```bash
-conda activate holosoma-plots
-python scripts/plot_sem_comparison.py --input aws-results --seeds 1 2 3 4 5
+bash scripts/sync_ec2_results.sh
 ```
 
-For an exploratory plot after both seed-1 methods finish:
+It excludes caches, temporary files, and live ONNX exports. After training
+ends, stop the loop and download ONNX exports as well:
 
 ```bash
-python scripts/plot_sem_comparison.py --input aws-results --seeds 1
+bash scripts/sync_ec2_results.sh --once
 ```
 
-If duplicate successful runs exist, explicitly exclude an unwanted directory
-with `--exclude-run DIRECTORY_NAME` (repeatable). Other options include
-`--output`, `--budget`, and `--bootstrap-samples`. The default output directory
-is `aws-results/comparison/`. Rerun after additional results sync to refresh it.
+Use `--remote-dir`, `--local-dir`, or a positional SSH alias to override
+paths. On macOS, prefix the command with `caffeinate -is` to prevent sleep
+while syncing. Training completion and syncing do not stop the EC2 instance.
 
-| Output | Contents |
+### Plot
+
+`scripts/plot_sem_comparison.py` infers input from `--budget`, checks paired
+configurations, and rejects missing pairs or duplicate successful runs.
+GPU hardware should also match across runs.
+
+```bash
+conda activate holosoma-plots && python scripts/plot_sem_comparison.py --budget 900 --seeds 1 2 3 4 5
+```
+
+```bash
+conda activate holosoma-plots && python scripts/plot_sem_comparison.py --budget 1800 --seeds 1 2 3 4 5 --timestamps-seconds 900 1800 --timestamp-max-lag-seconds 5
+```
+
+Outputs go to `aws-results/budget_<budget>s/comparison/`. Use `--output` to
+change that location and `--exclude-run DIRECTORY_NAME` to exclude an attempt.
+Plotting updates comparison files without changing checkpoints or run data.
+
+## Outputs
+
+Each `TIMESTAMP_METHOD_seedN/` directory contains:
+
+| File or directory | Contents |
 |---|---|
-| `comparison_wall_time.png` / `.pdf` | Four metrics versus startup-inclusive minutes |
-| `comparison_samples.png` / `.pdf` | The same metrics versus logged environment samples |
-| `paired_linear_difference.png` / `.pdf` | SEM minus FastSAC linear tracking, on both axes |
-| `summary.csv` | Method endpoint and normalized area-under-curve estimates |
-| `paired_summary.csv` | Paired SEM-minus-baseline differences and intervals |
-| `raw_metrics.csv` | In-budget observations with run/seed/step/time/sample identifiers |
-| `aligned_metrics.csv` | Interpolated observations used for aggregates |
-| `selected_runs.json` | Exact selected runs and analysis conventions |
+| `run.json` | Command, source revision, seed, budget, protocol, and status |
+| `console.log`, `nvidia-smi.txt` | Training output and GPU information |
+| `source.patch`, `launcher.py`, `source/` | Source changes and selected file snapshots |
+| `training/cmu16831-sem/EXPERIMENT/` | Configuration, metrics, timing, and checkpoints |
 
-For a local TensorBoard dashboard in the same Conda environment:
+The training directory contains `holosoma_config.yaml`, TensorBoard events,
+`timing.json`, `observations.jsonl`, `timestamps.json`, and PT/ONNX checkpoints.
+Available artifacts depend on the recorded protocol. Source snapshots do
+not replace a dependency lock. Results and checkpoints are ignored by Git.
 
-```bash
-tensorboard --logdir aws-results --host 127.0.0.1 --port 6006
-```
+The comparison directory contains wall-time and sample plots, paired
+differences, endpoint/AUC tables, timestamp summaries, sensitivity tables,
+raw diagnostics, and `selected_runs.json` with analysis settings.
+See [the results README](aws-results/README.md) for the directory layout.
 
-Open <http://127.0.0.1:6006>; no EC2 TensorBoard port needs to be exposed.
+## Metrics
 
-## Run outputs and provenance
+The four metrics are linear tracking reward, angular tracking reward,
+episode duration, and total episode reward. These are training-rollout
+statistics; tracking rewards are not physical velocity errors.
 
-The remote launcher writes under `logs/sem_experiments/`; the sync script
-mirrors its contents under local `aws-results/`. A typical run contains:
+Primary summaries use time-weighted trailing means (default 60 seconds),
+with 30- and 120-second sensitivity windows. Analysis excludes observations
+after each target and checks coverage, staleness, and gaps. Missing estimates
+are labeled; incomplete seed groups are not silently averaged. Endpoint and
+normalized AUC summaries use shared observed support, which can end before
+the requested deadline.
 
-```text
-TIMESTAMP_sem_seed1/
-  run.json                    # Command, revision/base, seed, timing, exit status
-  console.log                 # Training stdout/stderr
-  nvidia-smi.txt              # GPU/driver information
-  source.patch                # Tracked changes relative to 9c238cf8
-  launcher.py                 # Launcher snapshot
-  source/...                  # Selected SEM scripts/docs/test snapshots
-  training/cmu16831-sem/EXPERIMENT_DIRECTORY/
-    holosoma_config.yaml      # Saved experiment configuration
-    events.out.tfevents.*     # TensorBoard metrics
-    timing.json               # Training time, budget, overrun, final step
-    model_XXXXXXX.pt          # Periodic/final training checkpoints
-    model_XXXXXXX.onnx        # Exported deterministic policy
-```
+Confidence intervals bootstrap matched seeds, not time points. Raw values
+remain available as diagnostics. These summaries do not replace frozen-policy
+evaluation or establish sim-to-real performance. Use verified transition
+counts for sample-matched checkpoints and timing metadata for strict budgets.
 
-Git revision and patch capture tracked source changes, with selected SEM
-files snapshotted as well; they are not a complete snapshot of all untracked
-files or installed dependencies. Archive the working environment and commit
-used for a final report. Results, caches, and checkpoints remain outside the
-branch commit (`logs/` and `aws-results/` are ignored).
+See [timestamp collection](docs/sem_timed_runs.md) and
+[postprocessing](docs/sem_postprocessing.md) for definitions and options.
 
-## Metrics and interpretation
+## Tests
 
-The analysis uses four **training-rollout metrics**:
-
-| TensorBoard tag | Interpretation |
-|---|---|
-| `Episode/rew_tracking_lin_vel` | Linear velocity tracking reward |
-| `Episode/rew_tracking_ang_vel` | Angular velocity tracking reward |
-| `Train/mean_episode_length` | Episode duration, converted to seconds using saved simulator/control timing |
-| `Train/mean_reward` | Total episode reward |
-
-Tracking rewards are reward signals, not velocity error in physical units.
-Read their scale from this checkout's reward configuration. Prioritize linear
-tracking versus elapsed time and the paired difference for the compute-budget
-question; the sample axis helps separate sample efficiency from throughput.
-
-The analysis clips observations to 900 seconds using
-`Timing/elapsed_wall_time_s`, falling back to event timestamps relative to
-launcher start if needed. Sample counts come from `Train/num_samples`.
-For each metric/axis, aggregates use only the interval observed in **every**
-selected run. Linear interpolation does not extrapolate to time zero or the
-deadline. Consequently, curves can start after startup and end before minute
-15. The endpoint summary refers to the end of this shared interval, and
-normalized AUC is the integral over that interval divided by its length.
-It is not an entire-budget AUC that fills unobserved startup gaps with zero.
-
-Means show 95% pointwise percentile bootstrap intervals over matched seeds
-(2,000 resamples, RNG seed 0). Both methods use the same resampled seed
-indices; time points are not independent replicates. A single matched seed
-has no uncertainty band and undefined CSV interval bounds. Five seeds still
-provide limited uncertainty estimation; these intervals are exploratory,
-not a significance test. Training curves do not establish held-out robustness,
-real-robot transfer, or final deterministic policy quality; those require
-separate controlled checkpoint evaluations.
-
-## Tests and validation
-
-The branch includes tests for SEM geometry/gradients, baseline preservation,
-parameter counts, preset isolation, teammate task defaults, legacy CLI
-construction, ONNX parity, aggregation boundaries, and paired bootstrapping:
+Run algorithm tests in the training environment:
 
 ```bash
-# EC2: activated hsgym; pytest must be installed
 python -m pytest src/holosoma/holosoma/agents/fast_sac/tests/test_sem.py -q
-
-# Plotting environment; install pytest if needed
-conda activate holosoma-plots
-conda install -c conda-forge pytest -y
-python -m pytest scripts/tests/test_sem_plotting.py -q
 ```
 
-ONNX parity is skipped if its optional ONNX/ONNX Runtime dependencies are
-absent. The tests are provided for execution in the appropriate environment;
-this documentation does not assert that all tests have been run. Project
-training and tests are not executed on the Mac during branch preparation;
-local preparation checks are limited to syntax and diff validation.
+Run timing and analysis tests in the plotting environment:
 
-For detailed collection/analysis conventions, see
-[docs/sem_analysis.md](docs/sem_analysis.md). For the broader upstream training
-and deployment framework, see [the upstream overview](README.md) and
-[training guide](src/holosoma/README.md).
+```bash
+conda activate holosoma-plots && python -m pytest --confcutdir=scripts/tests scripts/tests/test_timed_experiment.py scripts/tests/test_sem_postprocessing.py scripts/tests/test_sem_plotting.py -q
+```
+
+`--confcutdir` avoids simulator-specific test imports. ONNX parity tests need
+ONNX and ONNX Runtime. For the broader framework, see [the upstream overview](README.md)
+and [training guide](src/holosoma/README.md).
